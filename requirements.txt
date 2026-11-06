@@ -1,0 +1,3 @@
+# Core demo has no third-party dependencies.
+kafka-python==2.0.2   # only needed for --kafka mode
+pytest==8.2.2         # tests
