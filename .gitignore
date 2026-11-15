@@ -1,4 +1,7 @@
 data/
 __pycache__/
 .pytest_cache/
+viewer/session.json
+WRITEUP.md
+viewer/session.json
 WRITEUP.md

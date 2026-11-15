@@ -16,6 +16,16 @@ pip install kafka-python
 python run_demo.py --kafka
 ```
 
+## 3D replay viewer (Three.js)
+
+```bash
+python export_viewer.py         # writes viewer/session.json from a replayed session
+python -m http.server 8000      # from the repo root
+# open http://localhost:8000/viewer/
+```
+
+A Three.js scene replays the session as a racket that tilts with the accelerometer data, with play/pause, speed control, a scrubbable timeline, and red marks wherever packets were lost. It also shows loss, reordering, clock drift, and p95 latency for the session.
+
 ## How it works
 
 ```

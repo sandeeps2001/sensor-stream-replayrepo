@@ -1,0 +1,162 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Session replay viewer</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Barlow+Condensed:wght@500;600&family=Barlow:wght@400;500&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --court: #1d4e89;      /* hard-court blue */
+    --surround: #2f6f57;   /* outer court green */
+    --line: #f2f5f7;       /* court lines */
+    --ball: #e3f24a;       /* ball yellow: used only for the playhead */
+    --loss: #ff6b5e;       /* lost packets */
+    --ink: #0f2742;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; background: var(--surround); color: var(--line);
+    font-family: "Barlow", system-ui, sans-serif; }
+  .app { display: grid; grid-template-rows: auto 1fr auto; height: 100%; }
+  header { padding: 18px 24px 10px; display: flex; gap: 24px; align-items: baseline; flex-wrap: wrap; }
+  h1 { font-family: "Barlow Condensed", "Arial Narrow", sans-serif; font-weight: 600;
+    font-size: 30px; letter-spacing: .5px; margin: 0; }
+  .stats { display: flex; gap: 22px; flex-wrap: wrap; font-size: 15px; opacity: .92; }
+  .stats b { font-family: "Barlow Condensed", sans-serif; font-size: 20px; font-weight: 500; margin-right: 4px; }
+  #stage { position: relative; margin: 0 24px; border: 2px solid var(--line); background: var(--court); min-height: 280px; }
+  #stage canvas { display: block; width: 100%; height: 100%; }
+  #readout { position: absolute; left: 14px; top: 10px; font-size: 14px; line-height: 1.5; }
+  footer { padding: 14px 24px 20px; display: grid; grid-template-columns: auto auto 1fr; gap: 14px; align-items: center; }
+  button, select { font: inherit; color: var(--ink); background: var(--line); border: 0; padding: 7px 14px; cursor: pointer; }
+  button:focus-visible, select:focus-visible, #timeline:focus-visible { outline: 3px solid var(--ball); outline-offset: 2px; }
+  #timeline { position: relative; height: 34px; background: var(--court); border: 2px solid var(--line); cursor: pointer; }
+  .tick { position: absolute; top: 0; bottom: 0; width: 2px; background: var(--loss); }
+  #head { position: absolute; top: -4px; bottom: -4px; width: 4px; background: var(--ball); }
+  .empty { padding: 40px 24px; max-width: 60ch; }
+  .empty code { background: var(--ink); padding: 2px 6px; }
+</style>
+</head>
+<body>
+<div class="app">
+  <header>
+    <h1>Session replay</h1>
+    <div class="stats" id="stats"></div>
+  </header>
+  <div id="stage"><div id="readout"></div></div>
+  <footer>
+    <button id="play" type="button">Play</button>
+    <select id="speed" aria-label="Playback speed">
+      <option value="0.25">0.25×</option><option value="0.5">0.5×</option>
+      <option value="1" selected>1×</option><option value="2">2×</option>
+    </select>
+    <div id="timeline" tabindex="0" role="slider" aria-label="Replay position"
+         aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"><div id="head"></div></div>
+  </footer>
+</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<script>
+(async function () {
+  const stage = document.getElementById("stage");
+  let data;
+  try {
+    data = await (await fetch("session.json")).json();
+  } catch (e) {
+    stage.outerHTML = '<div class="empty">No session loaded. From the repo root, run ' +
+      '<code>py export_viewer.py</code>, then <code>py -m http.server 8000</code>, and open ' +
+      '<code>localhost:8000/viewer/</code>.</div>';
+    return;
+  }
+  const ev = data.events, t0 = ev[0].t, t1 = ev[ev.length - 1].t, span = t1 - t0;
+
+  document.getElementById("stats").innerHTML =
+    `<span><b>${ev.length}</b>events</span>` +
+    `<span><b>${data.loss.loss_pct}%</b>lost</span>` +
+    `<span><b>${data.loss.reordered}</b>reordered</span>` +
+    `<span><b>${data.clock.drift_ppm}</b>ppm drift</span>` +
+    `<span><b>${data.latency.p95_ms} ms</b>p95 latency</span>`;
+
+  // lost-packet ticks on the timeline, placed by expected time of the missing seq
+  const tl = document.getElementById("timeline");
+  const rate = (ev.length - 1) / span;
+  data.lost_seqs.forEach(s => {
+    const d = document.createElement("div"); d.className = "tick";
+    d.style.left = Math.min(100, (s / (rate * span)) * 100) + "%"; tl.appendChild(d);
+  });
+
+  // three.js scene: a racket that tilts with the accelerometer reading
+  const renderer = new THREE.WebGLRenderer({ antialias: true });
+  renderer.setPixelRatio(window.devicePixelRatio);
+  stage.appendChild(renderer.domElement);
+  const scene = new THREE.Scene();
+  scene.background = new THREE.Color(0x1d4e89);
+  const camera = new THREE.PerspectiveCamera(40, 1, 0.1, 100);
+  camera.position.set(0, 1.2, 6);
+  scene.add(new THREE.HemisphereLight(0xffffff, 0x2f6f57, 1.0));
+  const sun = new THREE.DirectionalLight(0xffffff, 0.6); sun.position.set(3, 5, 4); scene.add(sun);
+
+  const court = new THREE.GridHelper(12, 12, 0xf2f5f7, 0x3d6aa3);
+  court.position.y = -1.6; scene.add(court);
+
+  const racket = new THREE.Group();
+  const frame = new THREE.Mesh(new THREE.TorusGeometry(0.75, 0.06, 12, 48),
+    new THREE.MeshStandardMaterial({ color: 0xf2f5f7, roughness: 0.4 }));
+  frame.scale.set(0.8, 1, 1); frame.position.y = 0.9;
+  const handle = new THREE.Mesh(new THREE.CylinderGeometry(0.07, 0.08, 1.2, 16),
+    new THREE.MeshStandardMaterial({ color: 0x0f2742, roughness: 0.7 }));
+  handle.position.y = -0.4;
+  racket.add(frame, handle); scene.add(racket);
+
+  function resize() {
+    const w = stage.clientWidth, h = Math.max(280, window.innerHeight - 190);
+    stage.style.height = h + "px"; renderer.setSize(w, h);
+    camera.aspect = w / h; camera.updateProjectionMatrix();
+  }
+  window.addEventListener("resize", resize); resize();
+
+  // playback
+  let pos = 0, playing = false, last = performance.now();
+  const readout = document.getElementById("readout"), head = document.getElementById("head");
+  const reduceMotion = matchMedia("(prefers-reduced-motion: reduce)").matches;
+  function indexAt(t) {            // binary search for the event at or before time t
+    let lo = 0, hi = ev.length - 1;
+    while (lo < hi) { const m = (lo + hi + 1) >> 1; if (ev[m].t <= t) lo = m; else hi = m - 1; }
+    return lo;
+  }
+  function draw() {
+    const e = ev[indexAt(t0 + pos)];
+    racket.rotation.z = Math.atan2(e.ax, e.az) * 0.9;   // swing tilt from lateral acceleration
+    racket.rotation.x = Math.atan2(e.ay, e.az) * 0.9;
+    const pct = (pos / span) * 100;
+    head.style.left = `calc(${pct}% - 2px)`; tl.setAttribute("aria-valuenow", pct.toFixed(0));
+    readout.innerHTML = `t = ${(t0 + pos).toFixed(3)} s<br>seq ${e.seq}<br>ax ${e.ax.toFixed(2)} &nbsp; ay ${e.ay.toFixed(2)}`;
+    renderer.render(scene, camera);
+  }
+  function loop(now) {
+    const dt = (now - last) / 1000; last = now;
+    if (playing) {
+      pos += dt * parseFloat(document.getElementById("speed").value);
+      if (pos >= span) { pos = span; playing = false; document.getElementById("play").textContent = "Replay"; }
+    }
+    draw(); requestAnimationFrame(loop);
+  }
+  document.getElementById("play").onclick = (b) => {
+    if (pos >= span) pos = 0;
+    playing = !playing; b.target.textContent = playing ? "Pause" : "Play";
+  };
+  function seek(clientX) {
+    const r = tl.getBoundingClientRect();
+    pos = Math.max(0, Math.min(1, (clientX - r.left) / r.width)) * span;
+  }
+  tl.addEventListener("pointerdown", e => seek(e.clientX));
+  tl.addEventListener("keydown", e => {
+    if (e.key === "ArrowRight") pos = Math.min(span, pos + span / 50);
+    if (e.key === "ArrowLeft") pos = Math.max(0, pos - span / 50);
+  });
+  if (reduceMotion) document.getElementById("speed").value = "0.5";
+  requestAnimationFrame(loop);
+})();
+</script>
+</body>
+</html>
