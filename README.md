@@ -1,14 +1,14 @@
 # sensor-stream-replay
 
-A small, testable pipeline for **timestamped sensor streams**: simulate a motion sensor over an unreliable link, ingest it (in memory or through Kafka), record versioned sessions, measure **loss, reordering, clock drift and latency**, and **replay sessions deterministically in event-time order**.
+![tests](https://github.com/sandeeps2001/sensor-stream-replayrepo/actions/workflows/tests.yml/badge.svg)
 
-Built by Sandeep Saravanan as a self-contained demo of the problems behind sensor-driven feedback systems.
+A small, tested pipeline for **timestamped sensor streams from multiple devices**: simulate motion sensors over an unreliable link, ingest them (in memory or through Kafka), record versioned sessions, measure **loss, duplicates, reordering, late data, per-device clock drift and latency**, and **replay sessions deterministically in event-time order**.
 
 ## Quick start
 
 ```bash
 python run_demo.py              # no dependencies, fully reproducible
-python -m pytest -q             # tests (pip install pytest)
+python -m pytest -q             # 8 tests (pip install pytest)
 
 # optional: run through real Kafka
 docker compose up -d
@@ -19,54 +19,61 @@ python run_demo.py --kafka
 ## 3D replay viewer (Three.js)
 
 ```bash
-python export_viewer.py         # writes viewer/session.json from a replayed session
+python export_viewer.py         # writes viewer/session.json
 python -m http.server 8000      # from the repo root
 # open http://localhost:8000/viewer/
 ```
 
-A Three.js scene replays the session as a racket that tilts with the accelerometer data, with play/pause, speed control, a scrubbable timeline, and red marks wherever packets were lost. It also shows loss, reordering, clock drift, and p95 latency for the session.
+Replays one racket's session in 3D, tilting with the accelerometer data, with play/pause, speed control, a scrubbable timeline, and red marks wherever packets were lost.
 
 ## How it works
 
 ```
-simulator ──► transport (in-memory | Kafka) ──► ingest ──► data/<session>/<version>/
- device clock      network delay, drops,         stamps         events.jsonl + meta.json
- offset + drift    reordering                     ingest_ts
-                                                      │
-                               metrics ◄──────────────┤
-                               loss, reorder,         │
-                               clock fit, latency     ▼
-                                                    replay (event-time order, deterministic)
+simulate_fleet ──► transport (in-memory | Kafka) ──► ingest ──► data/<session>/<version>/
+ one clock per       delay, drops, reordering,        stamps         events.jsonl + meta.json
+ device + drift      duplicates, end markers          ingest_ts
+                                                          │
+                          metrics ◄───────────────────────┤
+                          per-device loss, duplicates,    │
+                          reorder, late data, clocks      ▼
+                                                        replay (event-time order, deterministic)
 ```
 
 | Module | What it does |
 |---|---|
-| `simulator.py` | 100 Hz accelerometer events. Each carries a `seq` number and a `device_ts` from a clock that starts 250 ms off and drifts 200 ppm. The link adds delay and jitter, drops ~1% of events, and reorders ~2%. |
-| `transport.py` | In-memory transport (uses simulated arrival times as the ingestion clock) or Kafka (keyed by device so each device's events stay ordered within a partition). |
-| `ingest.py` | Stamps `ingest_ts`, writes `events.jsonl` + `meta.json`. The version ID is a hash of the content, so identical data always gets the same version. |
-| `metrics.py` | Loss from sequence gaps, reorder count, a clock model (offset + drift) fitted on the lower envelope of `ingest_ts - device_ts`, and latency percentiles. |
-| `replay.py` | Sorts by corrected device time, then device and seq, drops duplicates, and produces a digest to prove replays are identical. |
+| `simulator.py` | 100 Hz accelerometer events per device. Each device has its own clock offset and drift (ppm). The link adds delay and jitter, drops ~1%, reorders ~2%, duplicates ~0.5%, and can cut the tail of a stream. Each device ends with an end-of-session marker carrying its final sequence number. |
+| `transport.py` | In-memory transport, or Kafka keyed by device so each device's events stay ordered within a partition. |
+| `ingest.py` | Stamps `ingest_ts` and writes `events.jsonl` + `meta.json`. The version ID is a hash of the content. |
+| `metrics.py` | Per-device loss (from sequence numbers and the end marker), duplicates, reordering, watermark-based late-event detection, a per-device clock model, and latency percentiles. |
+| `replay.py` | Orders by corrected event time using each device's own clock, then device and seq, drops duplicates, and produces a digest proving replays are identical. |
 
-## Sample results (`python run_demo.py`)
+## Sample results (`python run_demo.py`, two devices)
 
-| Measure | Value |
-|---|---|
-| Loss | 12 of 1,000 events (1.2%), detected from sequence gaps |
-| Reordered arrivals | 10 |
-| Clock drift | estimated 180.6 ppm (true 200 ppm) |
-| Clock offset | estimated 0.235 s (true 0.250 s) |
-| Latency, estimated p50 / p95 / p99 | 5.1 / 9.6 / 12.8 ms |
-| Latency, ground truth p50 / p95 / p99 | 20.3 / 24.6 / 27.8 ms |
-| Replay | 988 events, identical digest across runs |
+| Measure | racket-01 | racket-02 |
+|---|---|---|
+| Lost (incl. tail) | 11 of 1,000 (1.1%) | 26 of 1,000 (2.6%) — includes 20 lost at the tail |
+| Duplicates removed | 2 | 2 |
+| Late events (20 ms watermark) | 7 | 12 |
+| Clock drift: estimated / true | 215.2 / 200 ppm | −135.3 / −150 ppm |
+| Clock offset: estimated / true | 0.235 / 0.250 s | −0.135 / −0.120 s |
 
-## Design decisions and limits
+Latency p50 / p95 / p99: estimated 5.0 / 9.5 / 33.0 ms, ground truth 20.2 / 24.7 / 48.1 ms. Replay: 1,963 events, identical digest on every run.
 
-- **Event time, not arrival time.** Replay orders by corrected device time, so late or reordered events land where they actually happened.
-- **Sequence numbers** are the most reliable loss signal. Timestamps alone can't tell a dropped event from a slow one.
+## Design decisions
+
+- **Sequence numbers, not timestamps, measure loss.** A timestamp can't tell a dropped event from a slow one; a gap in sequence numbers can.
+- **An end-of-session marker makes tail loss visible.** Gaps between the first and last *received* event miss anything lost at the end. The device's final sequence number, retried until delivered, closes that hole. A test shows exactly 20 lost events go unseen without it.
+- **One clock model per device.** Devices drift differently, so a single fit across devices is wrong; a test shows a global fit misses one device's drift by more than 100 ppm while per-device fits stay within 50.
 - **Clock model from the lower envelope.** Network delay is never negative, so the fastest arrivals in each window best reflect the true clock relationship.
-- **Known limit:** from one-way timestamps alone, a constant network delay is indistinguishable from clock offset. That's why estimated latency is ~15 ms below the true value: the minimum delay gets absorbed into the offset. Fixing it needs a two-way sync (NTP/PTP-style round trips) or a shared reference event, such as a known impact visible to both the sensor and a reference camera.
-- **Determinism** comes from a total ordering key (time, device, seq), fixed rounding, and duplicate removal. Tests check identical digests.
+- **Event time, not arrival time, for replay.** Late and reordered events land where they actually happened. Ordering by (corrected time, device, seq) with fixed rounding and duplicate removal makes replay deterministic.
+- **Watermark for late data.** An event is late if it arrives more than an allowed lateness behind the newest event already seen from that device; late events are flagged, not dropped.
 
-## Next steps
+## Known limits
 
-Two-way clock sync to separate offset from delay; per-device watermarks for late data; Parquet storage; a replay view plotting measured vs. reference motion with timing error.
+- **Offset vs. delay:** with one-way timestamps alone, a constant network delay is indistinguishable from clock offset, so estimated latency is ~15 ms below the truth. Fixing it needs two-way sync (NTP/PTP-style round trips) or a shared reference event, such as an impact seen by both the sensor and a camera.
+- The clock model is linear; real clocks can wander with temperature, which would need a windowed or piecewise fit.
+- If the end marker itself never arrives (device dies), tail loss falls back to the last received sequence number and can be undercounted.
+
+## How this was built (AI-assisted)
+
+I built this with AI coding tools. I specified the problem and the requirements (simulated clock drift, loss, reordering, duplicates, deterministic replay, measurable results), reviewed and ran every part on my own machine, and verified behavior with tests. After the first version, I reviewed my own design for weaknesses and added the fixes above: per-device clocks, the end-of-session marker for tail loss, duplicate handling, watermark-based late detection, and CI. The tests that demonstrate each failure mode (for example, the global clock fit being wrong) are there so the claims can be checked, not just read.
